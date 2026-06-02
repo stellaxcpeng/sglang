@@ -437,6 +437,7 @@ class _DeepEPDispatcherImplBase:
 
     def _update_int8_quant_env(self) -> None:
 <<<<<<< HEAD
+<<<<<<< HEAD
         """TODO adapt different quantization schemes for base model and draft model on NPU"""
         pass
 =======
@@ -447,6 +448,10 @@ class _DeepEPDispatcherImplBase:
         #    os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
         os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
 >>>>>>> 2aa645fd3 (kv cache int8 quantification)
+=======
+        """TODO adapt different quantization schemes for base model and draft model on NPU"""
+        pass
+>>>>>>> 127b04f95 (Resolve merge conflicts with upstream/main)
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
