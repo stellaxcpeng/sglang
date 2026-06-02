@@ -306,6 +306,10 @@ class AscendAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
+        self._logged_int8_kv_sparse_attention = False
+        self._log_int8_kv_sparse_attention = (
+            model_runner.tp_rank == 0 and model_runner.pp_rank == 0
+        )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.speculative_num_draft_tokens = (
@@ -733,6 +737,7 @@ class AscendAttnBackend(AttentionBackend):
         k_nope,
         q_pe,
         k_pe,
+        k_scale,
         topk_indices,
         layer,
         actual_seq_qlen,
@@ -750,6 +755,31 @@ class AscendAttnBackend(AttentionBackend):
 
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+
+        if k_nope.dtype == torch.int8:
+            attn_out_prev = self._forward_sparse_int8_kv(
+                q_nope_prev,
+                q_rope_prev,
+                k_nope,
+                k_pe,
+                k_scale,
+                topk_indices_prev,
+                layer,
+                actual_seq_qlen_prev,
+                actual_seq_lengths_kv_prev,
+            )
+            attn_out_next = self._forward_sparse_int8_kv(
+                q_nope_next,
+                q_rope_next,
+                k_nope,
+                k_pe,
+                k_scale,
+                topk_indices_next,
+                layer,
+                actual_seq_qlen_next,
+                actual_seq_lengths_kv_next,
+            )
+            return torch.cat([attn_out_prev, attn_out_next], dim=0)
 
         attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope_prev,
@@ -796,6 +826,83 @@ class AscendAttnBackend(AttentionBackend):
             return_softmax_lse=False,
         )
         return torch.cat([attn_out_prev, attn_out_next], dim=0)
+
+    def _pack_int8_mla_kv_for_sparse(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        k_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        # kv-quant SFA stores mixed MLA fields in one INT8 tensor by byte layout:
+        # int8 c_kv, bf16 k_rope bytes, then fp32 dequant scale bytes.
+        k_rope_bytes = k_pe.contiguous().view(torch.int8)
+        scale_bytes = k_scale.contiguous().view(torch.int8)
+        return torch.cat(
+            [k_nope.contiguous(), k_rope_bytes, scale_bytes],
+            dim=-1,
+        ).contiguous()
+
+    def _forward_sparse_int8_kv(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        k_scale: torch.Tensor,
+        topk_indices: torch.Tensor,
+        layer: RadixAttention,
+        actual_seq_qlen: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+    ) -> torch.Tensor:
+        if not hasattr(torch_npu, "npu_kv_quant_sparse_flash_attention"):
+            raise RuntimeError(
+                "INT8 KV cache for GLM/DSA sparse attention requires "
+                "torch_npu.npu_kv_quant_sparse_flash_attention. Please upgrade "
+                "torch_npu/CANN or use bfloat16/fp8_e4m3 kv_cache_dtype."
+            )
+
+        query = torch.cat([q_nope, q_pe], dim=-1).contiguous()
+        kv = self._pack_int8_mla_kv_for_sparse(k_nope, k_pe, k_scale)
+        if (
+            self._log_int8_kv_sparse_attention
+            and not self._logged_int8_kv_sparse_attention
+        ):
+            logger.info(
+                "Using npu_kv_quant_sparse_flash_attention for INT8 KV. "
+                f"query_shape={tuple(query.shape)}, kv_shape={tuple(kv.shape)}, "
+                f"scale_shape={tuple(k_scale.shape)}"
+            )
+            self._logged_int8_kv_sparse_attention = True
+
+        attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=query,
+            key=kv,
+            value=kv,
+            sparse_indices=topk_indices,
+            scale_value=layer.scaling,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            block_table=self.forward_metadata.block_tables,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=128,
+            rope_head_dim=self.qk_rope_head_dim,
+        )
+        if isinstance(attn_out, tuple):
+            attn_out = attn_out[0]
+        if attn_out.shape[-1] != self.kv_lora_rank:
+            attn_out = attn_out[..., : self.kv_lora_rank]
+        return attn_out
 
     def do_cp_attn_fia(
         self,
@@ -906,6 +1013,16 @@ class AscendAttnBackend(AttentionBackend):
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        is_int8_kv = self.token_to_kv_pool.store_dtype == torch.int8
+        if is_int8_kv:
+            k_pe = self.token_to_kv_pool.get_dequantized_value_buffer(
+                layer.layer_id, dtype=q_pe.dtype
+            )
+        k_scale = (
+            self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
+            if is_int8_kv
+            else None
+        )
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
@@ -958,6 +1075,19 @@ class AscendAttnBackend(AttentionBackend):
                 k_nope,
                 q_pe,
                 k_pe,
+                k_scale,
+                topk_indices,
+                layer,
+                actual_seq_qlen,
+                actual_seq_lengths_kv,
+            )
+        elif is_int8_kv:
+            attn_out = self._forward_sparse_int8_kv(
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                k_scale,
                 topk_indices,
                 layer,
                 actual_seq_qlen,
@@ -1004,7 +1134,11 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        if is_mla_preprocess_enabled() and self.use_mla:
+        if (
+            is_mla_preprocess_enabled()
+            and self.use_mla
+            and self.token_to_kv_pool.store_dtype != torch.int8
+        ):
             # MLAPO and MLAPROLOG do save kv_cache
             save_kv_cache = False
         if self.is_dllm_model:
@@ -1719,6 +1853,13 @@ class AscendAttnBackend(AttentionBackend):
             return attn_output
         else:
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            is_int8_kv = self.token_to_kv_pool.store_dtype == torch.int8
+            c_kv_scale = None
+            if is_int8_kv:
+                k_rope = self.token_to_kv_pool.get_dequantized_value_buffer(
+                    layer.layer_id, dtype=q_rope.dtype
+                )
+                c_kv_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
                     k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
@@ -1726,6 +1867,10 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache = _reshape_kv_for_fia_nz(
                     c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
                 )
+                if is_int8_kv:
+                    c_kv_scale = c_kv_scale.view(
+                        -1, self.page_size, self.token_to_kv_pool.kv_scale_tiles
+                    )
             else:
                 k_rope_cache = k_rope.view(
                     -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
@@ -1733,6 +1878,13 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache = c_kv.view(
                     -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
                 )
+                if is_int8_kv:
+                    c_kv_scale = c_kv_scale.view(
+                        -1,
+                        layer.tp_v_head_num,
+                        self.page_size,
+                        self.token_to_kv_pool.kv_scale_tiles,
+                    )
 
             q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
             q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
@@ -1767,8 +1919,8 @@ class AscendAttnBackend(AttentionBackend):
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
                 scale=layer.scaling,
-                antiquant_mode=0,
-                antiquant_scale=None,
+                antiquant_mode=1 if is_int8_kv else 0,
+                antiquant_scale=c_kv_scale,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
                 sparse_mode=3,
@@ -1788,8 +1940,8 @@ class AscendAttnBackend(AttentionBackend):
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
                 scale=layer.scaling,
-                antiquant_mode=0,
-                antiquant_scale=None,
+                antiquant_mode=1 if is_int8_kv else 0,
+                antiquant_scale=c_kv_scale,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
                 sparse_mode=3,
@@ -1913,6 +2065,13 @@ class AscendAttnBackend(AttentionBackend):
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            is_int8_kv = self.token_to_kv_pool.store_dtype == torch.int8
+            c_kv_scale = None
+            if is_int8_kv:
+                k_rope = self.token_to_kv_pool.get_dequantized_value_buffer(
+                    layer.layer_id, dtype=q_rope.dtype
+                )
+                c_kv_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
                     k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
@@ -1920,6 +2079,10 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache = _reshape_kv_for_fia_nz(
                     c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
                 )
+                if is_int8_kv:
+                    c_kv_scale = c_kv_scale.view(
+                        -1, self.page_size, self.token_to_kv_pool.kv_scale_tiles
+                    )
             else:
                 k_rope_cache = k_rope.view(
                     -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
@@ -1927,6 +2090,10 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache = c_kv.view(
                     -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
                 )
+                if is_int8_kv:
+                    c_kv_scale = c_kv_scale.view(
+                        -1, self.page_size, self.token_to_kv_pool.kv_scale_tiles
+                    )
 
             q_nope = q.view(-1, 1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
             q_rope = q_rope.view(-1, 1, layer.tp_q_head_num, self.qk_rope_head_dim)
@@ -1969,8 +2136,8 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSND",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=0,
-                antiquant_scale=None,
+                antiquant_mode=1 if is_int8_kv else 0,
+                antiquant_scale=c_kv_scale,
                 sparse_mode=0,
             )
             output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
@@ -1989,8 +2156,8 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSND",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=0,
-                antiquant_scale=None,
+                antiquant_mode=1 if is_int8_kv else 0,
+                antiquant_scale=c_kv_scale,
                 sparse_mode=0,
                 workspace=workspace,
                 out=[output, softmax_lse],
@@ -2014,7 +2181,11 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        if is_mla_preprocess_enabled() and self.use_mla:
+        if (
+            is_mla_preprocess_enabled()
+            and self.use_mla
+            and self.token_to_kv_pool.store_dtype != torch.int8
+        ):
             # MLAPO does saving kv_cache
             save_kv_cache = False
         if topk_indices is not None:
@@ -2239,6 +2410,13 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            is_int8_kv = self.token_to_kv_pool.store_dtype == torch.int8
+            c_kv_scale = None
+            if is_int8_kv:
+                k_pe = self.token_to_kv_pool.get_dequantized_value_buffer(
+                    layer.layer_id, dtype=q_rope.dtype
+                )
+                c_kv_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
 
             if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
@@ -2249,6 +2427,10 @@ class AscendAttnBackend(AttentionBackend):
                     k_pe = _reshape_kv_for_fia_nz(
                         k_pe, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
                     )
+                    if is_int8_kv:
+                        c_kv_scale = c_kv_scale.view(
+                            -1, self.page_size, self.token_to_kv_pool.kv_scale_tiles
+                        )
                 else:
                     kv_c = kv_c.view(
                         -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
@@ -2256,6 +2438,10 @@ class AscendAttnBackend(AttentionBackend):
                     k_pe = k_pe.view(
                         -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
                     )
+                    if is_int8_kv:
+                        c_kv_scale = c_kv_scale.view(
+                            -1, self.page_size, self.token_to_kv_pool.kv_scale_tiles
+                        )
                 q = q.view(
                     forward_batch.batch_size, -1, layer.tp_q_head_num, self.kv_lora_rank
                 )
@@ -2277,13 +2463,18 @@ class AscendAttnBackend(AttentionBackend):
                     atten_mask=None,
                     sparse_mode=0,
                     scale=layer.scaling,
-                    antiquant_mode=0,
-                    antiquant_scale=None,
+                    antiquant_mode=1 if is_int8_kv else 0,
+                    antiquant_scale=c_kv_scale,
                     block_table=self.forward_metadata.block_tables,
                     block_size=self.page_size,
                     actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
                 )
             else:
+                if is_int8_kv:
+                    raise NotImplementedError(
+                        "INT8 KV cache is not supported with _npu_paged_attention_mla. "
+                        "Use FIA (ASCEND_USE_FIA=1) for INT8 KV cache, or switch to bf16/fp8 kv_cache_dtype."
+                    )
                 assert (
                     self.graph_mode == False
                 )  # _npu_paged_attention_mla not support graph mode

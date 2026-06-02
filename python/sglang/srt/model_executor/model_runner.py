@@ -2259,10 +2259,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype == "int8":
+            if _is_npu:
+                import torch_npu
+
+                if not hasattr(torch_npu, "npu_kv_quant_sparse_flash_attention"):
+                    raise RuntimeError(
+                        "INT8 KV cache on Ascend NPU requires "
+                        "torch_npu.npu_kv_quant_sparse_flash_attention. Please "
+                        "upgrade torch_npu/CANN or use bfloat16/fp8_e4m3 "
+                        "kv_cache_dtype."
+                    )
+                if not hasattr(torch_npu, "npu_quant_lightning_indexer"):
+                    raise RuntimeError(
+                        "INT8 DSA index_k on Ascend NPU requires "
+                        "torch_npu.npu_quant_lightning_indexer. Please upgrade "
+                        "torch_npu/CANN or use bfloat16/fp8_e4m3 kv_cache_dtype."
+                    )
+            self.kv_cache_dtype = torch.int8
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
+        log_info_on_rank0(logger, f"Configured kv_cache_dtype as {self.kv_cache_dtype}.")
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""

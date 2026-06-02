@@ -132,6 +132,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
+            if (
+                kv_cache_dtype == torch.int8
+                and mr.device == "npu"
+                and is_deepseek_dsa(model_config.hf_config)
+            ):
+                kv_quant_tile_size = 128
+                kv_scale_tiles = (
+                    model_config.kv_lora_rank + kv_quant_tile_size - 1
+                ) // kv_quant_tile_size
+                index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+                per_layer_size = (
+                    model_config.kv_lora_rank
+                    + kv_scale_tiles * torch._utils._element_size(torch.float32)
+                    + model_config.qk_rope_head_dim
+                    + torch._utils._element_size(torch.float32)
+                    + index_head_dim
+                    + torch._utils._element_size(torch.float16)
+                )
+                return per_layer_size * num_layers
+
             cell_size = (
                 (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                 * num_layers
