@@ -170,23 +170,6 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 127b04f95 (Resolve merge conflicts with upstream/main)
-        exit_stack = ExitStack()
-        if (
-            _is_npu
-            and self.quant_config is None
-            and get_global_server_args().quantization is not None
-        ):
-            # ascend mtp unquant
-            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
-            exit_stack.enter_context(
-                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
-            )
-<<<<<<< HEAD
-=======
         if _is_npu and self.quant_config is not None:
             os.environ["SGLANG DEEPEP_BF16_DISPATCH"] = "1"
             os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
@@ -198,9 +181,6 @@ class DeepseekModelNextN(nn.Module):
                 input_embeds.device if input_embeds is not None else input_ids.device
             ),
         )
->>>>>>> 2aa645fd3 (kv cache int8 quantification)
-=======
->>>>>>> 127b04f95 (Resolve merge conflicts with upstream/main)
 
         try:
             zero_allocator = BumpAllocator(
@@ -252,10 +232,6 @@ class DeepseekModelNextN(nn.Module):
                     zero_allocator,
                 )
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 127b04f95 (Resolve merge conflicts with upstream/main)
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
@@ -275,14 +251,6 @@ class DeepseekModelNextN(nn.Module):
         finally:
             exit_stack.close()
 
-<<<<<<< HEAD
-=======
-        if _is_npu and self.quant_config is not None:
-            os.environ["SGLANG DEEPEP_BF16_DISPATCH"] = "1"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
->>>>>>> 2aa645fd3 (kv cache int8 quantification)
-=======
->>>>>>> 127b04f95 (Resolve merge conflicts with upstream/main)
         return hidden_states
 
 
