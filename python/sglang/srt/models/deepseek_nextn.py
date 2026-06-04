@@ -170,17 +170,17 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if _is_npu and self.quant_config is not None:
-            os.environ["SGLANG DEEPEP_BF16_DISPATCH"] = "1"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
-
-        zero_allocator = BumpAllocator(
-            buffer_size=2,
-            dtype=torch.float32,
-            device=(
-                input_embeds.device if input_embeds is not None else input_ids.device
-            ),
-        )
+        exit_stack = ExitStack()
+        if (
+            _is_npu
+            and self.quant_config is None
+            and get_global_server_args().quantization is not None
+        ):
+            # ascend mtp unquant
+            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
+            exit_stack.enter_context(
+                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
+            )
 
         try:
             zero_allocator = BumpAllocator(
