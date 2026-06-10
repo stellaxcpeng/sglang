@@ -292,21 +292,47 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
         self.kv_quant_tile_size = 128
-        if self.store_dtype == torch.int8:
+        self.enable_int8_k_buffer = self.store_dtype == torch.int8 and get_bool_env_var(
+            "SGLANG_NPU_INT8_K_BUFFER", "true"
+        )
+        self.enable_int8_index_k_buffer = (
+            self.store_dtype == torch.int8
+            and self.index_head_dim is not None
+            and get_bool_env_var("SGLANG_NPU_INT8_INDEX_K_BUFFER", "true")
+        )
+        if self.enable_int8_k_buffer:
             assert self.kv_lora_rank % self.kv_quant_tile_size == 0, (
                 "INT8 MLA KV cache requires kv_lora_rank to be divisible by "
                 f"{self.kv_quant_tile_size}, but got {self.kv_lora_rank}."
+            )
+        if self.store_dtype == torch.int8:
+            logger.info(
+                "NPU INT8 KV ablation switches: k_buffer=%s, "
+                "index_k_buffer=%s, v_buffer=bf16(always)",
+                self.enable_int8_k_buffer,
+                self.enable_int8_index_k_buffer,
             )
         self.kv_scale_tiles = max(
             1,
             (self.kv_lora_rank + self.kv_quant_tile_size - 1)
             // self.kv_quant_tile_size,
         )
-        self._logged_int8_rope_quantization = False
-        self._logged_int8_rope_dequantization = False
+        self._logged_bf16_k_buffer_storage = False
+        self._logged_bf16_index_k_storage = False
+        self._logged_int8_k_quantization = False
         self._logged_int8_index_quantization = False
 
         self.custom_mem_pool = None
+        k_buffer_dtype = torch.int8 if self.enable_int8_k_buffer else self.dtype
+        v_buffer_dtype = self.dtype
+        if self.store_dtype != torch.int8:
+            k_buffer_dtype = self.store_dtype
+            v_buffer_dtype = self.store_dtype
+        index_k_dtype = (
+            torch.int8
+            if self.enable_int8_index_k_buffer
+            else (self.dtype if self.store_dtype == torch.int8 else self.store_dtype)
+        )
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -318,11 +344,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     1,
                     self.kv_lora_rank,
                 ),
-                dtype=self.store_dtype,
+                dtype=k_buffer_dtype,
                 device=self.device,
             )
             self.k_buffer_scale = None
-            if self.store_dtype == torch.int8:
+            if self.enable_int8_k_buffer:
                 self.k_buffer_scale = torch.zeros(
                     (
                         layer_num,
@@ -342,25 +368,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     1,
                     self.qk_rope_head_dim,
                 ),
-                dtype=self.store_dtype,
+                dtype=v_buffer_dtype,
                 device=self.device,
             )
-            self.v_buffer_scale = None
-            if self.store_dtype == torch.int8:
-                self.v_buffer_scale = torch.zeros(
-                    (
-                        layer_num,
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        1,
-                    ),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
             self.index_k_buffer = None
             self.index_k_scale_buffer = None
             if self.index_head_dim is not None:
-                index_k_dtype = self.store_dtype
                 self.index_k_buffer = torch.zeros(
                     (
                         layer_num,
@@ -372,7 +385,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=index_k_dtype,
                     device=self.device,
                 )
-                if self.store_dtype == torch.int8:
+                if self.enable_int8_index_k_buffer:
                     self.index_k_scale_buffer = torch.zeros(
                         (
                             layer_num,
@@ -384,6 +397,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         device=self.device,
                     )
 
+        logger.info(
+            "NPU MLA KV buffer dtypes: k_buffer=%s, v_buffer=%s, index_k_buffer=%s",
+            self.k_buffer.dtype,
+            self.v_buffer.dtype,
+            None if self.index_k_buffer is None else self.index_k_buffer.dtype,
+        )
         self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
@@ -394,19 +413,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(k_cache)
         for v_cache in self.v_buffer:
             kv_size_bytes += get_tensor_size_bytes(v_cache)
-        if self.store_dtype == torch.int8:
-            assert self.k_buffer_scale is not None
+        if self.k_buffer_scale is not None:
             for scale_cache in self.k_buffer_scale:
-                kv_size_bytes += get_tensor_size_bytes(scale_cache)
-            assert self.v_buffer_scale is not None
-            for scale_cache in self.v_buffer_scale:
                 kv_size_bytes += get_tensor_size_bytes(scale_cache)
         if self.index_head_dim is not None:
             assert hasattr(self, "index_k_buffer")
             for index_k_cache in self.index_k_buffer:
                 kv_size_bytes += get_tensor_size_bytes(index_k_cache)
-            if self.store_dtype == torch.int8:
-                assert self.index_k_scale_buffer is not None
+            if self.index_k_scale_buffer is not None:
                 for scale_cache in self.index_k_scale_buffer:
                     kv_size_bytes += get_tensor_size_bytes(scale_cache)
         return kv_size_bytes
@@ -425,27 +439,37 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
         data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        if self.index_k_scale_buffer is not None:
+            data_ptrs += [
+                self.index_k_scale_buffer[i].data_ptr() for i in range(self.layer_num)
+            ]
+            data_lens += [
+                self.index_k_scale_buffer[i].nbytes for i in range(self.layer_num)
+            ]
+            item_lens += [
+                self.index_k_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+            ]
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype == torch.int8:
-            return self.k_buffer[layer_id - self.start_layer]
-        if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+        k_buffer = self.k_buffer[layer_id - self.start_layer]
+        if k_buffer.dtype == torch.int8:
+            return k_buffer
+        if k_buffer.dtype != self.dtype:
+            return k_buffer.view(self.dtype)
+        return k_buffer
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype == torch.int8:
-            return self.v_buffer[layer_id - self.start_layer]
-        if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+        v_buffer = self.v_buffer[layer_id - self.start_layer]
+        if v_buffer.dtype != self.dtype:
+            return v_buffer.view(self.dtype)
+        return v_buffer
 
     def get_kv_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -453,53 +477,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         assert self.k_buffer_scale is not None
         return self.k_buffer_scale[layer_id - self.start_layer]
 
-    def get_value_scale_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.v_buffer_scale[layer_id - self.start_layer]
-
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        assert self.index_k_scale_buffer is not None
         return self.index_k_scale_buffer[layer_id - self.start_layer]
-
-    def get_dequantized_value_buffer(
-        self, layer_id: int, dtype: torch.dtype = torch.bfloat16
-    ):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
-        v_buffer = self.v_buffer[layer_id - self.start_layer]
-        if self.store_dtype != torch.int8:
-            if self.store_dtype != self.dtype:
-                return v_buffer.view(self.dtype)
-            return v_buffer
-
-        v_scale = self.v_buffer_scale[layer_id - self.start_layer]
-        if not self._logged_int8_rope_dequantization:
-            logger.info(
-                "Using dequantized k_rope from INT8 v_buffer. "
-                f"v_buffer_shape={tuple(v_buffer.shape)}, "
-                f"v_scale_shape={tuple(v_scale.shape)}, "
-                f"dequant_dtype={dtype}"
-            )
-            self._logged_int8_rope_dequantization = True
-        return v_buffer.to(dtype) * v_scale.unsqueeze(-1).to(dtype)
 
     def get_index_k_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype == torch.int8:
-            return self.index_k_buffer[layer_id - self.start_layer]
-        if self.store_dtype != self.dtype:
-            return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.index_k_buffer[layer_id - self.start_layer]
+        index_k_buffer = self.index_k_buffer[layer_id - self.start_layer]
+        if index_k_buffer.dtype == torch.int8:
+            return index_k_buffer
+        if index_k_buffer.dtype != self.dtype:
+            return index_k_buffer.view(self.dtype)
+        return index_k_buffer
 
     # for disagg
     def get_contiguous_buf_infos(self):
         # Returns: c_kv (k_buffer), k_rope (v_buffer), scales, and optionally index_k.
-        # INT8 mode transfers raw INT8 k_rope plus a per-token rope scale.
         kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
             self.v_buffer[i].data_ptr() for i in range(self.layer_num)
         ]
@@ -509,7 +506,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
             self.v_buffer[i][0].nbytes for i in range(self.layer_num)
         ]
-        if self.store_dtype == torch.int8:
+        if self.k_buffer_scale is not None:
             # c_kv_scale (FP32): one scale per token per 128-wide latent tile.
             kv_data_ptrs += [
                 self.k_buffer_scale[i].data_ptr() for i in range(self.layer_num)
@@ -519,15 +516,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ]
             kv_item_lens += [
                 self.k_buffer_scale[i][0].nbytes for i in range(self.layer_num)
-            ]
-            kv_data_ptrs += [
-                self.v_buffer_scale[i].data_ptr() for i in range(self.layer_num)
-            ]
-            kv_data_lens += [
-                self.v_buffer_scale[i].nbytes for i in range(self.layer_num)
-            ]
-            kv_item_lens += [
-                self.v_buffer_scale[i][0].nbytes for i in range(self.layer_num)
             ]
         if self.index_head_dim is not None:
             kv_data_ptrs += [
@@ -539,7 +527,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_item_lens += [
                 self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
             ]
-            if self.store_dtype == torch.int8:
+            if self.index_k_scale_buffer is not None:
                 kv_data_ptrs += [
                     self.index_k_scale_buffer[i].data_ptr()
                     for i in range(self.layer_num)
@@ -582,26 +570,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         cache_k_i8 = quant_rows.view_as(cache_k)
         cache_k_scale = tile_scale.view(*cache_k.shape[:-1], self.kv_scale_tiles)
-        return cache_k_i8, cache_k_scale
-
-    def _quantize_rope_per_token(
-        self, cache_v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dynamic-quantize MLA k_rope with one scale per token."""
-        rows = cache_v.contiguous().view(-1, self.qk_rope_head_dim)
-        cache_v_i8, cache_v_scale = torch.ops.npu.npu_dynamic_quant(
-            rows, dst_type=torch.int8
-        )
-        if not self._logged_int8_rope_quantization:
+        if not self._logged_int8_k_quantization:
             logger.info(
-                "Quantizing k_rope into INT8 v_buffer. "
-                f"source_shape={tuple(cache_v.shape)}, "
-                f"quant_shape={tuple(cache_v_i8.view_as(cache_v).shape)}, "
-                f"scale_shape={tuple(cache_v_scale.view(*cache_v.shape[:-1]).shape)}, "
-                f"source_dtype={cache_v.dtype}"
+                "Quantizing c_kv into INT8 k_buffer. "
+                f"source_shape={tuple(cache_k.shape)}, "
+                f"quant_shape={tuple(cache_k_i8.shape)}, "
+                f"scale_shape={tuple(cache_k_scale.shape)}, "
+                f"source_dtype={cache_k.dtype}"
             )
-            self._logged_int8_rope_quantization = True
-        return cache_v_i8.view_as(cache_v), cache_v_scale.view(*cache_v.shape[:-1])
+            self._logged_int8_k_quantization = True
+        return cache_k_i8, cache_k_scale
 
     def _quantize_index_k(
         self, index_k: torch.Tensor
@@ -638,18 +616,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
-        if self.store_dtype == torch.int8:
+        if self.enable_int8_k_buffer:
             assert cache_k.shape[-2] == 1, (
                 "INT8 MLA KV cache expects one KV head for kv-quant sparse attention, "
                 f"but got cache_k shape {tuple(cache_k.shape)}."
             )
-            # INT8 mode: dynamic-quantize c_kv per 128-wide tile and
-            # k_rope per token. Attention kernels consume dequantized k_rope.
             cache_k_i8, cache_k_scale = self._quantize_kv_lora_rank_per_tile(cache_k)
             antiquant_scale = self._quant_scale_to_antiquant_scale(cache_k_scale)
-            cache_v_i8, cache_v_scale = self._quantize_rope_per_token(cache_v)
-            rope_antiquant_scale = self._quant_scale_to_antiquant_scale(cache_v_scale)
-
             torch_npu.npu_scatter_nd_update_(
                 self.k_buffer[layer_id - self.start_layer].view(
                     -1, 1, self.kv_lora_rank
@@ -664,29 +637,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 loc.view(-1, 1),
                 antiquant_scale.view(-1, 1, self.kv_scale_tiles),
             )
-
-            torch_npu.npu_scatter_nd_update_(
-                self.v_buffer[layer_id - self.start_layer].view(
-                    -1, 1, self.qk_rope_head_dim
-                ),
-                loc.view(-1, 1),
-                cache_v_i8.view(-1, 1, self.qk_rope_head_dim),
-            )
-            torch_npu.npu_scatter_nd_update_(
-                self.v_buffer_scale[layer_id - self.start_layer].view(-1, 1, 1),
-                loc.view(-1, 1),
-                rope_antiquant_scale.view(-1, 1, 1),
-            )
         else:
-            # BF16 / FP8 path: no quantization, just dtype conversion and store.
+            if self.store_dtype == torch.int8 and not self._logged_bf16_k_buffer_storage:
+                logger.info(
+                    "Storing c_kv in BF16 k_buffer because "
+                    "SGLANG_NPU_INT8_K_BUFFER=0."
+                )
+                self._logged_bf16_k_buffer_storage = True
             if cache_k.dtype != self.dtype:
                 cache_k = cache_k.to(self.dtype)
-                cache_v = cache_v.to(self.dtype)
-
-            if self.store_dtype != self.dtype:
+            if self.store_dtype != torch.int8 and self.store_dtype != self.dtype:
                 cache_k = cache_k.view(self.store_dtype)
-                cache_v = cache_v.view(self.store_dtype)
-
             torch_npu.npu_scatter_nd_update_(
                 self.k_buffer[layer_id - self.start_layer].view(
                     -1, 1, self.kv_lora_rank
@@ -694,13 +655,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 loc.view(-1, 1),
                 cache_k.view(-1, 1, self.kv_lora_rank),
             )
-            torch_npu.npu_scatter_nd_update_(
-                self.v_buffer[layer_id - self.start_layer].view(
-                    -1, 1, self.qk_rope_head_dim
-                ),
-                loc.view(-1, 1),
-                cache_v.view(-1, 1, self.qk_rope_head_dim),
-            )
+
+        if cache_v.dtype != self.dtype:
+            cache_v = cache_v.to(self.dtype)
+        if self.store_dtype != torch.int8 and self.store_dtype != self.dtype:
+            cache_v = cache_v.view(self.store_dtype)
+
+        torch_npu.npu_scatter_nd_update_(
+            self.v_buffer[layer_id - self.start_layer].view(
+                -1, 1, self.qk_rope_head_dim
+            ),
+            loc.view(-1, 1),
+            cache_v.view(-1, 1, self.qk_rope_head_dim),
+        )
 
     def set_index_k_buffer(
         self,
@@ -708,7 +675,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
-        if self.store_dtype == torch.int8:
+        if self.enable_int8_index_k_buffer:
             index_k_i8, index_k_scale = self._quantize_index_k(index_k)
             torch_npu.npu_scatter_nd_update_(
                 self.index_k_buffer[layer_id - self.start_layer].view(
@@ -724,7 +691,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
             return
 
-        index_dtype = torch.bfloat16 if self.store_dtype == torch.int8 else self.dtype
+        if self.store_dtype == torch.int8 and not self._logged_bf16_index_k_storage:
+            logger.info(
+                "Storing index_k in BF16 index_k_buffer because "
+                "SGLANG_NPU_INT8_INDEX_K_BUFFER=0."
+            )
+            self._logged_bf16_index_k_storage = True
+        index_dtype = self.dtype
         if index_k.dtype != index_dtype:
             index_k = index_k.to(index_dtype)
         if self.store_dtype != torch.int8 and self.store_dtype != self.dtype:
@@ -766,12 +739,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 self.k_buffer_scale[local_layer_id].view(
                     -1, 1, self.kv_scale_tiles
                 )
-                if self.store_dtype == torch.int8
-                else None
-            )
-            v_scale_layer = (
-                self.v_buffer_scale[local_layer_id].view(-1, 1, 1)
-                if self.store_dtype == torch.int8
+                if self.k_buffer_scale is not None
                 else None
             )
             ik_layer = (
@@ -781,12 +749,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
             ik_scale_layer = (
                 self.index_k_scale_buffer[local_layer_id].view(-1, 1, 1)
-                if has_ik and self.store_dtype == torch.int8
+                if has_ik and self.index_k_scale_buffer is not None
                 else None
             )
-            buf_of_layers.append(
-                [k_layer, v_layer, scale_layer, v_scale_layer, ik_layer, ik_scale_layer]
-            )
+            buf_of_layers.append([k_layer, v_layer, scale_layer, ik_layer, ik_scale_layer])
 
         kv_cache_cpu = self._chunk_copy_npu_to_cpu(buf_of_layers, indices)
         torch.npu.synchronize()
@@ -803,12 +769,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 self.k_buffer_scale[local_layer_id].view(
                     -1, 1, self.kv_scale_tiles
                 )
-                if self.store_dtype == torch.int8
-                else None
-            )
-            v_scale_layer = (
-                self.v_buffer_scale[local_layer_id].view(-1, 1, 1)
-                if self.store_dtype == torch.int8
+                if self.k_buffer_scale is not None
                 else None
             )
             ik_layer = (
@@ -818,7 +779,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
             ik_scale_layer = (
                 self.index_k_scale_buffer[local_layer_id].view(-1, 1, 1)
-                if has_ik and self.store_dtype == torch.int8
+                if has_ik and self.index_k_scale_buffer is not None
                 else None
             )
             for i in range(0, len(indices), chunk_size):
@@ -829,16 +790,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 assert k_cpu.shape[0] == len(chunk_indices)
                 k_layer[chunk_indices] = k_cpu.to(k_layer.device, non_blocking=True)
                 v_layer[chunk_indices] = v_cpu.to(v_layer.device, non_blocking=True)
-                if self.store_dtype == torch.int8:
+                if self.k_buffer_scale is not None:
                     scale_cpu = chunk[next_idx]
                     next_idx += 1
                     scale_layer[chunk_indices] = scale_cpu.to(
                         scale_layer.device, non_blocking=True
-                    )
-                    v_scale_cpu = chunk[next_idx]
-                    next_idx += 1
-                    v_scale_layer[chunk_indices] = v_scale_cpu.to(
-                        v_scale_layer.device, non_blocking=True
                     )
                 if has_ik:
                     ik_cpu = chunk[next_idx]
@@ -846,7 +802,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ik_layer[chunk_indices] = ik_cpu.to(
                         ik_layer.device, non_blocking=True
                     )
-                    if self.store_dtype == torch.int8:
+                    if self.index_k_scale_buffer is not None:
                         ik_scale_cpu = chunk[next_idx]
                         ik_scale_layer[chunk_indices] = ik_scale_cpu.to(
                             ik_scale_layer.device, non_blocking=True

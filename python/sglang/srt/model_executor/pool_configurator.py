@@ -28,7 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.utils.common import is_float4_e2m1fn_x2
+from sglang.srt.utils.common import get_bool_env_var, is_float4_e2m1fn_x2
 
 
 @dataclass
@@ -142,13 +142,34 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     model_config.kv_lora_rank + kv_quant_tile_size - 1
                 ) // kv_quant_tile_size
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                per_layer_size = (
+                enable_int8_k_buffer = get_bool_env_var(
+                    "SGLANG_NPU_INT8_K_BUFFER", "true"
+                )
+                enable_int8_index_k_buffer = get_bool_env_var(
+                    "SGLANG_NPU_INT8_INDEX_K_BUFFER", "true"
+                )
+                k_buffer_size = (
                     model_config.kv_lora_rank
                     + kv_scale_tiles * torch._utils._element_size(torch.float32)
-                    + model_config.qk_rope_head_dim
-                    + torch._utils._element_size(torch.float32)
-                    + index_head_dim
-                    + torch._utils._element_size(torch.float16)
+                    if enable_int8_k_buffer
+                    else model_config.kv_lora_rank
+                    * torch._utils._element_size(torch.bfloat16)
+                )
+                rope_size = model_config.qk_rope_head_dim * torch._utils._element_size(
+                    torch.bfloat16
+                )
+                index_k_size = (
+                    index_head_dim + torch._utils._element_size(torch.float16)
+                    if enable_int8_index_k_buffer
+                    else index_head_dim * torch._utils._element_size(torch.bfloat16)
+                )
+                per_layer_size = k_buffer_size + rope_size + index_k_size
+                logger.info(
+                    "NPU INT8 DeepSeek DSA KV cell size: per_layer=%s bytes "
+                    "(k_buffer_int8=%s, index_k_int8=%s, v_buffer=bf16).",
+                    per_layer_size,
+                    enable_int8_k_buffer,
+                    enable_int8_index_k_buffer,
                 )
                 return per_layer_size * num_layers
 

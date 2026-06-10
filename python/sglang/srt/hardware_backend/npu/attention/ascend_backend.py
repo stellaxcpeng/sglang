@@ -1013,11 +1013,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        is_int8_kv = self.token_to_kv_pool.store_dtype == torch.int8
-        if is_int8_kv:
-            k_pe = self.token_to_kv_pool.get_dequantized_value_buffer(
-                layer.layer_id, dtype=q_pe.dtype
-            )
+        is_int8_kv = k_nope.dtype == torch.int8
         k_scale = (
             self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             if is_int8_kv
@@ -1853,12 +1849,9 @@ class AscendAttnBackend(AttentionBackend):
             return attn_output
         else:
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            is_int8_kv = self.token_to_kv_pool.store_dtype == torch.int8
+            is_int8_kv = c_kv.dtype == torch.int8
             c_kv_scale = None
             if is_int8_kv:
-                k_rope = self.token_to_kv_pool.get_dequantized_value_buffer(
-                    layer.layer_id, dtype=q_rope.dtype
-                )
                 c_kv_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
@@ -2065,12 +2058,9 @@ class AscendAttnBackend(AttentionBackend):
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            is_int8_kv = self.token_to_kv_pool.store_dtype == torch.int8
+            is_int8_kv = c_kv.dtype == torch.int8
             c_kv_scale = None
             if is_int8_kv:
-                k_rope = self.token_to_kv_pool.get_dequantized_value_buffer(
-                    layer.layer_id, dtype=q_rope.dtype
-                )
                 c_kv_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
@@ -2410,12 +2400,9 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-            is_int8_kv = self.token_to_kv_pool.store_dtype == torch.int8
+            is_int8_kv = kv_c.dtype == torch.int8
             c_kv_scale = None
             if is_int8_kv:
-                k_pe = self.token_to_kv_pool.get_dequantized_value_buffer(
-                    layer.layer_id, dtype=q_rope.dtype
-                )
                 c_kv_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
 
             if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:

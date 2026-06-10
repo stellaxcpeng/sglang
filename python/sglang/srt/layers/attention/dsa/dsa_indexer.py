@@ -296,6 +296,7 @@ class Indexer(MultiPlatformOp):
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
     _mqa_logits_budget_bytes: Dict[int, int] = {}
     _logged_npu_quant_lightning_indexer = False
+    _logged_npu_lightning_indexer = False
 
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
@@ -1910,6 +1911,17 @@ class Indexer(MultiPlatformOp):
                     actual_seq_lengths_key=actual_seq_lengths_kv,
                     block_table=block_table,
                 )
+            if (
+                past_key_states.dtype == torch.bfloat16
+                and not Indexer._logged_npu_lightning_indexer
+            ):
+                logger.info(
+                    "Using npu_lightning_indexer for BF16 index_k. "
+                    f"query_shape={tuple(query.shape)}, "
+                    f"key_shape={tuple(past_key_states.shape)}, "
+                    f"weights_dtype={None if weights is None else weights.dtype}"
+                )
+                Indexer._logged_npu_lightning_indexer = True
             topk_indices = torch_npu.npu_lightning_indexer(
                 query=query,
                 key=past_key_states,
