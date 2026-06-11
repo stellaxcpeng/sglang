@@ -115,6 +115,13 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def should_reuse_dsa_mtp_topk_indices(config) -> bool:
+    return (
+        is_deepseek_dsa(config)
+        and _hf_attr(config, "index_skip_topk_offset") is not None
+    )
+
+
 def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",
