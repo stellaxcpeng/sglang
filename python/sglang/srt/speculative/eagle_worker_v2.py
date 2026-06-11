@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.model_config import should_reuse_dsa_mtp_topk_indices
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -188,6 +189,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        self._reuse_mtp_topk_indices = should_reuse_dsa_mtp_topk_indices(
+            self.draft_runner.model_config.hf_config
+        )
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
@@ -534,6 +538,8 @@ class EagleDraftWorker(BaseDraftWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+        forward_batch.topk_indices = None
+        forward_batch.reuse_mtp_topk_indices = self._reuse_mtp_topk_indices
 
         # Forward multiple steps
         scores = None
