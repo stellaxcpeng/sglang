@@ -51,32 +51,6 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
-_GLM_MOE_DSA_RAW_CONFIG_FIELDS = (
-    "qk_rope_head_dim",
-    "qk_nope_head_dim",
-    "v_head_dim",
-    "kv_lora_rank",
-    "index_head_dim",
-    "index_topk",
-    "index_n_heads",
-    "index_topk_freq",
-    "index_topk_pattern",
-    "index_skip_topk_offset",
-)
-
-
-def _restore_glm_moe_dsa_raw_config_fields(config, raw_config):
-    for key in _GLM_MOE_DSA_RAW_CONFIG_FIELDS:
-        if key in raw_config:
-            setattr(config, key, raw_config[key])
-    if (
-        hasattr(config, "qk_head_dim")
-        and hasattr(config, "qk_nope_head_dim")
-        and hasattr(config, "qk_rope_head_dim")
-    ):
-        config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-
-
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -104,7 +78,26 @@ class HfModelConfigParser(ModelConfigParserBase):
             from transformers import PretrainedConfig
 
             raw_config, _ = PretrainedConfig.get_config_dict(model, revision=revision)
-            _restore_glm_moe_dsa_raw_config_fields(config, raw_config)
+            for key in (
+                "qk_rope_head_dim",
+                "qk_nope_head_dim",
+                "v_head_dim",
+                "kv_lora_rank",
+                "index_head_dim",
+                "index_topk",
+                "index_n_heads",
+                "index_topk_freq",
+                "index_topk_pattern",
+                "index_skip_topk_offset",
+            ):
+                if key in raw_config:
+                    setattr(config, key, raw_config[key])
+            if (
+                hasattr(config, "qk_head_dim")
+                and hasattr(config, "qk_nope_head_dim")
+                and hasattr(config, "qk_rope_head_dim")
+            ):
+                config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
         if (
             config.architectures is not None
