@@ -1564,7 +1564,7 @@ class DeepseekV2AttentionMLA(
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
             if is_nextn:
-                self.skip_topk = True
+                self.skip_topk = False
                 self.next_skip_topk = True
             else:
                 self.index_topk_freq = getattr(config, "index_topk_freq", 1)
@@ -1602,7 +1602,6 @@ class DeepseekV2AttentionMLA(
                     else:
                         self.next_skip_topk = False
             if not self.skip_topk:
-                log_info_on_rank0(logger, f'======layer_id={layer_id}======')
                 self.indexer = Indexer(
                     hidden_size=hidden_size,
                     index_n_heads=get_dsa_index_n_heads(config),
@@ -1862,6 +1861,7 @@ class DeepseekV2AttentionMLA(
                 forward_batch,
                 zero_allocator,
                 layer_scatter_modes,
+                prev_topk_indices,
             )
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
