@@ -21,6 +21,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.srt.distributed import (
+    get_lm_head_tensor_parallel_world_size,
+    get_lm_head_tp_group,
+    tensor_model_parallel_all_gather,
+)
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -161,6 +166,7 @@ class LogitsMetadata:
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The gather mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
+    orig_dp_padding_mode: Optional[DpPaddingMode] = None
     # for padding
     padded_static_len: int = -1
 
@@ -219,6 +225,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
+            orig_dp_padding_mode=forward_batch.dp_padding_mode,
             mm_input_embeds=forward_batch.mm_input_embeds,
         )
 
@@ -859,11 +866,21 @@ class LogitsProcessor(nn.Module):
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
-                logits = self._logits_gatherer(logits)
+                if (
+                    envs.SGLANG_LM_HEAD_TP.get() > 1
+                    and logits_metadata.orig_dp_padding_mode == DpPaddingMode.MAX_LEN
+                ):
+                    logits = get_lm_head_tp_group().all_to_all(logits)
+                else:
+                    logits = tensor_model_parallel_all_gather(logits)
 
-        logits = self._scatter_dp_attn_logits(
-            logits, local_hidden_states, logits_metadata
-        )
+        if not (
+            envs.SGLANG_LM_HEAD_TP.get() > 1
+            and logits_metadata.orig_dp_padding_mode == DpPaddingMode.MAX_LEN
+        ):
+            logits = self._scatter_dp_attn_logits(
+                logits, local_hidden_states, logits_metadata
+            )
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
@@ -925,6 +942,23 @@ class LogitsProcessor(nn.Module):
     def _gather_dp_attn_hidden_states(
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            envs.SGLANG_LM_HEAD_TP.get() > 1
+            and logits_metadata.orig_dp_padding_mode == DpPaddingMode.MAX_LEN
+        ):
+            gathered_hidden_states = torch.empty(
+                (
+                    hidden_states.shape[0] * get_lm_head_tensor_parallel_world_size(),
+                    hidden_states.shape[1],
+                ),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            get_lm_head_tp_group().all_gather_into_tensor(
+                gathered_hidden_states, hidden_states
+            )
+            return gathered_hidden_states, hidden_states
+
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata()
             local_hidden_states = hidden_states
