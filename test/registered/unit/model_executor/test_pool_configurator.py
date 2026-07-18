@@ -553,11 +553,10 @@ class TestNpuDsaIndexKInt8Sizing(unittest.TestCase):
         mr.model_config.kv_lora_rank = 512
         mr.model_config.qk_rope_head_dim = 64
         mr.model_config.index_head_dim = 128
-        mr.model_config.hf_config = SimpleNamespace(
-            architectures=["DeepseekV32ForCausalLM"],
-            index_topk=2048,
-            index_head_dim=128,
-        )
+        hf_config = mr.model_config.hf_config
+        hf_config.architectures = ["DeepseekV32ForCausalLM"]
+        hf_config.index_topk = 2048
+        hf_config.index_head_dim = 128
         return mr
 
     def test_only_index_k_cost_changes(self):
