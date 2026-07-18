@@ -30,6 +30,8 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    get_dsa_index_head_dim,
+    is_deepseek_dsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -1074,6 +1076,48 @@ class ModelRunner:
             )
 
     def configure_kv_cache_dtype(self):
+        if self.server_args.kv_cache_dtype == "int8":
+            if self.device != "npu":
+                raise ValueError(
+                    "--kv-cache-dtype=int8 is currently limited to DSA index_k "
+                    "quantization on Ascend NPU."
+                )
+            if not is_deepseek_dsa(self.model_config.hf_config):
+                raise ValueError(
+                    "--kv-cache-dtype=int8 on Ascend NPU currently requires a "
+                    "DeepSeek Sparse Attention model with index_k cache."
+                )
+
+            index_head_dim = get_dsa_index_head_dim(self.model_config.hf_config)
+            if index_head_dim != 128:
+                raise ValueError(
+                    "npu_quant_lightning_indexer requires index_head_dim=128, "
+                    f"but the model config has index_head_dim={index_head_dim}."
+                )
+
+            import torch_npu
+
+            if not hasattr(torch.ops.npu, "npu_dynamic_quant"):
+                raise RuntimeError(
+                    "INT8 DSA index_k requires torch.ops.npu.npu_dynamic_quant. "
+                    "Please check the installed torch_npu/CANN packages."
+                )
+            if not hasattr(torch_npu, "npu_quant_lightning_indexer"):
+                raise RuntimeError(
+                    "INT8 DSA index_k requires "
+                    "torch_npu.npu_quant_lightning_indexer. Please check that "
+                    "custom_ops, torch_npu, and CANN are version-compatible."
+                )
+
+            # Only index_k is quantized. c_kv and k_rope retain the model dtype.
+            self.kv_cache_dtype = getattr(self, "dtype", torch.bfloat16)
+            logger.info(
+                "Configured Ascend DSA index_k as INT8; main MLA KV cache "
+                "remains %s.",
+                self.kv_cache_dtype,
+            )
+            return
+
         spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(

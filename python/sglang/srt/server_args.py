@@ -607,7 +607,9 @@ class ServerArgs:
                 '"fp8_e4m3" are supported for CUDA 11.8+. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                'recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "int8" '
+                "enables INT8 DSA index_k storage on Ascend NPU while keeping "
+                "the main MLA KV cache in the model dtype."
             ),
             choices=[
                 "auto",
@@ -618,6 +620,7 @@ class ServerArgs:
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
+                "int8",
             ],
             resolvable=True,
         ),

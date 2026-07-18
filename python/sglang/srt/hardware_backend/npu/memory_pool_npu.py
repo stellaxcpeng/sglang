@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
 
 if is_npu():
     import torch_npu
+
+logger = logging.getLogger(__name__)
 
 
 def _init_npu_conv_state(
@@ -298,6 +301,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        enable_index_k_int8: bool = False,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -315,6 +319,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.enable_index_k_int8 = enable_index_k_int8
+        self._logged_int8_index_quantization = False
+
+        if self.enable_index_k_int8:
+            if self.index_head_dim is None:
+                raise ValueError("INT8 index_k storage requires index_head_dim.")
+            if self.index_head_dim != 128:
+                raise ValueError(
+                    "npu_quant_lightning_indexer requires index_head_dim=128, "
+                    f"but got {self.index_head_dim}."
+                )
 
         self.custom_mem_pool = None
 
@@ -343,6 +358,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 device=self.device,
             )
             self.index_k_buffer = None
+            self.index_k_scale_buffer = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
                     (
@@ -352,10 +368,35 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=(
+                        torch.int8 if self.enable_index_k_int8 else self.store_dtype
+                    ),
                     device=self.device,
                 )
+                if self.enable_index_k_int8:
+                    self.index_k_scale_buffer = torch.zeros(
+                        (
+                            layer_num,
+                            self.size // self.page_size + 1,
+                            self.page_size,
+                            1,
+                        ),
+                        dtype=torch.float16,
+                        device=self.device,
+                    )
 
+        logger.info(
+            "NPU MLA cache dtypes: k_buffer=%s, v_buffer=%s, "
+            "index_k_buffer=%s, index_k_scale_buffer=%s",
+            self.k_buffer.dtype,
+            self.v_buffer.dtype,
+            None if self.index_k_buffer is None else self.index_k_buffer.dtype,
+            (
+                None
+                if self.index_k_scale_buffer is None
+                else self.index_k_scale_buffer.dtype
+            ),
+        )
         self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
@@ -370,6 +411,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             assert hasattr(self, "index_k_buffer")
             for index_k_cache in self.index_k_buffer:
                 kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+            if self.index_k_scale_buffer is not None:
+                for index_k_scale_cache in self.index_k_scale_buffer:
+                    kv_size_bytes += get_tensor_size_bytes(index_k_scale_cache)
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
@@ -386,6 +430,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
         data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        if self.index_k_scale_buffer is not None:
+            data_ptrs += [
+                self.index_k_scale_buffer[i].data_ptr()
+                for i in range(self.layer_num)
+            ]
+            data_lens += [
+                self.index_k_scale_buffer[i].nbytes for i in range(self.layer_num)
+            ]
+            item_lens += [
+                self.index_k_scale_buffer[i][0].nbytes
+                for i in range(self.layer_num)
+            ]
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
@@ -408,9 +464,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        index_k_buffer = self.index_k_buffer[layer_id - self.start_layer]
+        if index_k_buffer.dtype == torch.int8:
+            return index_k_buffer
         if self.store_dtype != self.dtype:
-            return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.index_k_buffer[layer_id - self.start_layer]
+            return index_k_buffer.view(self.dtype)
+        return index_k_buffer
+
+    def get_index_k_scale_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if self.index_k_scale_buffer is None:
+            raise RuntimeError("index_k scale buffer is only available in INT8 mode.")
+        return self.index_k_scale_buffer[layer_id - self.start_layer]
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -434,6 +500,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_item_lens += [
                 self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
             ]
+            if self.index_k_scale_buffer is not None:
+                kv_data_ptrs += [
+                    self.index_k_scale_buffer[i].data_ptr()
+                    for i in range(self.layer_num)
+                ]
+                kv_data_lens += [
+                    self.index_k_scale_buffer[i].nbytes
+                    for i in range(self.layer_num)
+                ]
+                kv_item_lens += [
+                    self.index_k_scale_buffer[i][0].nbytes
+                    for i in range(self.layer_num)
+                ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
@@ -471,12 +550,56 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
 
+    def _quantize_index_k(
+        self, index_k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize each index_k token independently along its 128-wide row."""
+        if index_k.dtype not in (torch.float16, torch.bfloat16):
+            index_k = index_k.to(torch.bfloat16)
+        rows = index_k.contiguous().view(-1, self.index_head_dim)
+        index_k_i8, index_k_scale = torch.ops.npu.npu_dynamic_quant(
+            rows, dst_type=torch.int8
+        )
+        index_k_i8 = index_k_i8.view_as(index_k)
+        # npu_dynamic_quant returns the dequant multiplier: x ~= q * scale.
+        index_k_scale = index_k_scale.view(*index_k.shape[:-1]).to(torch.float16)
+        if not self._logged_int8_index_quantization:
+            logger.info(
+                "Quantizing DSA index_k into INT8 index_k_buffer. "
+                "source_shape=%s, quant_shape=%s, scale_shape=%s, source_dtype=%s",
+                tuple(index_k.shape),
+                tuple(index_k_i8.shape),
+                tuple(index_k_scale.shape),
+                index_k.dtype,
+            )
+            self._logged_int8_index_quantization = True
+        return index_k_i8, index_k_scale
+
     def set_index_k_buffer(
         self,
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
+        if self.enable_index_k_int8:
+            index_k_i8, index_k_scale = self._quantize_index_k(index_k)
+            torch_npu.npu_scatter_nd_update_(
+                self.index_k_buffer[layer_id - self.start_layer].view(
+                    -1, 1, self.index_head_dim
+                ),
+                loc.view(-1, 1),
+                index_k_i8.view(-1, 1, self.index_head_dim),
+            )
+            index_k_scale_buffer = self.index_k_scale_buffer[
+                layer_id - self.start_layer
+            ].view(-1, 1, 1)
+            torch_npu.npu_scatter_nd_update_(
+                index_k_scale_buffer,
+                loc.view(-1, 1),
+                index_k_scale.view(-1, 1, 1),
+            )
+            return
+
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
 
@@ -494,7 +617,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
         chunk_size = self.cpu_offloading_chunk_size
         out = []
-        for tensors_per_layer in buf_of_layers:  # [k_buf, v_buf, ik_buf/None]
+        for tensors_per_layer in buf_of_layers:
             layer_chunks = []
             for i in range(0, len(indices), chunk_size):
                 ci = indices[i : i + chunk_size]
@@ -520,7 +643,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 if has_ik
                 else None
             )
-            buf_of_layers.append([k_layer, v_layer, ik_layer])
+            ik_scale_layer = (
+                self.index_k_scale_buffer[local_layer_id].view(-1, 1, 1)
+                if has_ik and self.index_k_scale_buffer is not None
+                else None
+            )
+            buf_of_layers.append([k_layer, v_layer, ik_layer, ik_scale_layer])
 
         kv_cache_cpu = self._chunk_copy_npu_to_cpu(buf_of_layers, indices)
         torch.npu.synchronize()
@@ -538,6 +666,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 if has_ik
                 else None
             )
+            ik_scale_layer = (
+                self.index_k_scale_buffer[local_layer_id].view(-1, 1, 1)
+                if has_ik and self.index_k_scale_buffer is not None
+                else None
+            )
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 chunk = kv_cache_cpu[local_layer_id][i // chunk_size]
@@ -550,4 +683,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ik_layer[chunk_indices] = ik_cpu.to(
                         ik_layer.device, non_blocking=True
                     )
+                    if ik_scale_layer is not None:
+                        ik_scale_cpu = chunk[3]
+                        ik_scale_layer[chunk_indices] = ik_scale_cpu.to(
+                            ik_scale_layer.device, non_blocking=True
+                        )
         torch.npu.synchronize()

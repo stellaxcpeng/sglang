@@ -205,16 +205,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
-                cell_size += (
-                    indexer_size_per_token * effective_num_layers * element_size
-                )
+                if kvc.device == "npu":
+                    if kvc.server_args.kv_cache_dtype == "int8":
+                        indexer_size_per_token = (
+                            index_head_dim
+                            + torch._utils._element_size(torch.float16)
+                        )
+                    else:
+                        indexer_size_per_token = index_head_dim * kv_size
+                    cell_size += indexer_size_per_token * effective_num_layers
+                else:
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        DSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
+                    cell_size += (
+                        indexer_size_per_token * effective_num_layers * element_size
+                    )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).

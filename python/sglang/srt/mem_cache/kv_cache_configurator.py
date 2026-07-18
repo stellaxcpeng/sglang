@@ -1024,6 +1024,9 @@ class KVCacheConfigurator:
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_index_k_int8=(
+                is_dsa_model and self.server_args.kv_cache_dtype == "int8"
+            ),
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )

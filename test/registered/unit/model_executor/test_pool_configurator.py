@@ -73,6 +73,7 @@ def _make_model_runner(
     mr.start_layer = 0
     mr.end_layer = num_layers
     mr.dp_size = 1
+    mr.device = "cuda"
     mr.page_size = page_size
     mr.mambaish_config = mambaish_config
     mr.is_hybrid_swa = is_hybrid_swa
@@ -118,6 +119,7 @@ def _make_model_runner(
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_dsa_cache_layer_split = False
+    sa.kv_cache_dtype = "auto"
     mr.server_args = sa
 
     spec = MagicMock()
@@ -542,6 +544,37 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestNpuDsaIndexKInt8Sizing(unittest.TestCase):
+    def _make_npu_dsa_runner(self):
+        mr = _make_model_runner(num_layers=2, use_mla_backend=True)
+        mr.device = "npu"
+        mr.model_config.kv_lora_rank = 512
+        mr.model_config.qk_rope_head_dim = 64
+        mr.model_config.index_head_dim = 128
+        mr.model_config.hf_config = SimpleNamespace(
+            architectures=["DeepseekV32ForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+        )
+        return mr
+
+    def test_only_index_k_cost_changes(self):
+        mr = self._make_npu_dsa_runner()
+        with mock_cpu_env(kv_size=2):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            bf16_cell_size = create_memory_pool_configurator(mr)._cell_size
+            mr.server_args.kv_cache_dtype = "int8"
+            int8_cell_size = create_memory_pool_configurator(mr)._cell_size
+
+        # Main MLA KV remains BF16: (512 + 64) * 2 = 1152 bytes/layer.
+        self.assertEqual(bf16_cell_size, (1152 + 128 * 2) * 2)
+        # INT8 index_k plus one FP16 scale: 128 + 2 = 130 bytes/layer.
+        self.assertEqual(int8_cell_size, (1152 + 130) * 2)
 
 
 class TestFactory(unittest.TestCase):

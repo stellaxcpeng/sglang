@@ -357,6 +357,7 @@ class Indexer(MultiPlatformOp):
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
     _mqa_logits_budget_bytes: Dict[int, int] = {}
+    _logged_npu_quant_lightning_indexer = False
 
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
@@ -2069,6 +2070,126 @@ class Indexer(MultiPlatformOp):
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)
 
+    def _quantize_npu_indexer_query(
+        self, query: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            query = query.to(torch.bfloat16)
+        rows = query.contiguous().view(-1, self.head_dim)
+        query_i8, query_scale = torch.ops.npu.npu_dynamic_quant(
+            rows, dst_type=torch.int8
+        )
+        query_i8 = query_i8.view_as(query)
+        query_scale = query_scale.view(*query.shape[:-1]).to(torch.float16)
+        return query_i8, query_scale
+
+    def _run_npu_quant_lightning_indexer(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        weights: Optional[torch.Tensor],
+        key_scale: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        if query.ndim != 3 or query.shape[-1] != 128:
+            raise ValueError(
+                "npu_quant_lightning_indexer TND query must have shape "
+                f"[T, Q_N, 128], but got {tuple(query.shape)}."
+            )
+        if not 1 <= query.shape[-2] <= 64:
+            raise ValueError(
+                "npu_quant_lightning_indexer requires 1 <= Q_N <= 64, "
+                f"but got Q_N={query.shape[-2]}."
+            )
+        if key.ndim != 4 or key.shape[-2:] != (1, 128):
+            raise ValueError(
+                "npu_quant_lightning_indexer PA_BSND key must have shape "
+                f"[block_count, block_size, 1, 128], but got {tuple(key.shape)}."
+            )
+        if key.shape[1] % 16 != 0 or key.shape[1] > 1024:
+            raise ValueError(
+                "npu_quant_lightning_indexer PA_BSND block_size must be a "
+                f"multiple of 16 and <= 1024, but got {key.shape[1]}."
+            )
+        if not 1 <= self.index_topk <= 2048:
+            raise ValueError(
+                "npu_quant_lightning_indexer requires 1 <= sparse_count <= 2048, "
+                f"but got {self.index_topk}."
+            )
+        if key.dtype != torch.int8:
+            raise TypeError(
+                "npu_quant_lightning_indexer requires INT8 key, "
+                f"but got {key.dtype}."
+            )
+        if key_scale is None:
+            raise ValueError("INT8 index_k requires a key dequant scale buffer.")
+        if tuple(key_scale.shape) != tuple(key.shape[:-1]):
+            raise ValueError(
+                "INT8 index_k scale shape must equal key.shape[:-1], "
+                f"but got scale={tuple(key_scale.shape)} and key={tuple(key.shape)}."
+            )
+        if weights is None:
+            raise ValueError("npu_quant_lightning_indexer requires indexer weights.")
+
+        query_i8, query_scale = self._quantize_npu_indexer_query(query)
+        quant_weights = weights.to(torch.float16).contiguous()
+        key_scale = key_scale.to(torch.float16).contiguous()
+        actual_seq_lengths_query = actual_seq_lengths_query.to(
+            device=query.device, dtype=torch.int32
+        ).contiguous()
+        actual_seq_lengths_key = actual_seq_lengths_key.to(
+            device=query.device, dtype=torch.int32
+        ).contiguous()
+        block_table = block_table.to(
+            device=query.device, dtype=torch.int32
+        ).contiguous()
+
+        batch_count = actual_seq_lengths_query.numel()
+        if (
+            actual_seq_lengths_key.numel() != batch_count
+            or block_table.shape[0] != batch_count
+        ):
+            raise ValueError(
+                "npu_quant_lightning_indexer TND metadata batch mismatch: "
+                f"query_lengths={batch_count}, "
+                f"key_lengths={actual_seq_lengths_key.numel()}, "
+                f"block_table_rows={block_table.shape[0]}."
+            )
+
+        if not Indexer._logged_npu_quant_lightning_indexer:
+            logger.info(
+                "Using npu_quant_lightning_indexer for INT8 index_k. "
+                "query_shape=%s, key_shape=%s, weights_dtype=%s, "
+                "query_scale_shape=%s, key_scale_shape=%s, scale_dtype=%s",
+                tuple(query_i8.shape),
+                tuple(key.shape),
+                quant_weights.dtype,
+                tuple(query_scale.shape),
+                tuple(key_scale.shape),
+                query_scale.dtype,
+            )
+            Indexer._logged_npu_quant_lightning_indexer = True
+
+        topk_indices = torch_npu.npu_quant_lightning_indexer(
+            query_i8.contiguous(),
+            key.contiguous(),
+            quant_weights,
+            query_scale.contiguous(),
+            key_scale,
+            query_quant_mode=0,
+            key_quant_mode=0,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=self.index_topk,
+            sparse_mode=3,
+        )
+        return topk_indices[0] if isinstance(topk_indices, tuple) else topk_indices
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -2293,7 +2414,14 @@ class Indexer(MultiPlatformOp):
                     get_attn_backend().forward_metadata.actual_seq_lengths_q
                 )
 
-        past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
+        token_to_kv_pool = get_token_to_kv_pool()
+        past_key_states = token_to_kv_pool.get_index_k_buffer(layer_id)
+        is_int8_index_k = past_key_states.dtype == torch.int8
+        past_key_scales = (
+            token_to_kv_pool.get_index_k_scale_buffer(layer_id)
+            if is_int8_index_k
+            else None
+        )
 
         if self.rotary_emb.is_neox_style and self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
@@ -2315,6 +2443,7 @@ class Indexer(MultiPlatformOp):
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
+                past_key_scales,
                 weights,
                 actual_seq_lengths_q,
                 actual_seq_lengths_kv,
@@ -2328,8 +2457,21 @@ class Indexer(MultiPlatformOp):
                 else block_table
             )
 
+            query = q.view(-1, self.n_heads, self.head_dim)
+            if is_int8_index_k:
+                topk_indices = self._run_npu_quant_lightning_indexer(
+                    query=query,
+                    key=past_key_states,
+                    weights=weights,
+                    key_scale=past_key_scales,
+                    actual_seq_lengths_query=actual_seq_lengths_q,
+                    actual_seq_lengths_key=actual_seq_lengths_kv,
+                    block_table=block_table,
+                )
+                return topk_indices.squeeze(1)
+
             topk_indices = torch_npu.npu_lightning_indexer(
-                query=q.view(-1, self.n_heads, self.head_dim),
+                query=query,
                 key=past_key_states,
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
@@ -2349,6 +2491,7 @@ class Indexer(MultiPlatformOp):
         self,
         q,
         past_key_states,
+        past_key_scales,
         indexer_weights,
         actual_seq_lengths_q,
         actual_seq_lengths_kv,
@@ -2365,6 +2508,27 @@ class Indexer(MultiPlatformOp):
 
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+
+        if past_key_states.dtype == torch.int8:
+            topk_indices_prev = self._run_npu_quant_lightning_indexer(
+                query=q_prev,
+                key=past_key_states,
+                weights=weights_prev,
+                key_scale=past_key_scales,
+                actual_seq_lengths_query=actual_seq_lengths_q_prev,
+                actual_seq_lengths_key=actual_seq_lengths_kv_prev,
+                block_table=block_table,
+            )
+            topk_indices_next = self._run_npu_quant_lightning_indexer(
+                query=q_next,
+                key=past_key_states,
+                weights=weights_next,
+                key_scale=past_key_scales,
+                actual_seq_lengths_query=actual_seq_lengths_q_next,
+                actual_seq_lengths_key=actual_seq_lengths_kv_next,
+                block_table=block_table,
+            )
+            return topk_indices_prev, topk_indices_next
 
         topk_indices_prev = torch_npu.npu_lightning_indexer(
             query=q_prev,

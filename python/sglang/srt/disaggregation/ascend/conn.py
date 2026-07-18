@@ -44,8 +44,7 @@ class AscendKVManager(MooncakeKVManager):
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], int]:
-        # src_kv_ptrs: k_data, v_data, index_k_data(optional)
-        # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
+        # Group-major buffers: k, v, optional index_k, optional index_k_scale.
         start_layer = self.kv_args.prefill_start_layer
         kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)
         total_kv_layers = getattr(self.kv_args, "total_kv_layers", 0)
