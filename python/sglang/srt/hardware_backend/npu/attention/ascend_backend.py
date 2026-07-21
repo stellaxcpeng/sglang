@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -15,6 +16,9 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+from sglang.srt.hardware_backend.npu.attention.dsa_graph_utils import (
+    align_lightning_indexer_graph_metadata,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -26,6 +30,7 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
@@ -524,6 +529,80 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         self.graph_mode = False
+
+    @contextmanager
+    def align_dsa_graph_metadata_for_indexer(
+        self, forward_batch: ForwardBatch, num_query_tokens: int
+    ):
+        """Temporarily align NPU DSA metadata during graph capture.
+
+        Attention-TP gathering can expand the static query buffer beyond the
+        number of real request rows. The lightning indexer requires query, key
+        lengths, and block tables to expose the same TND batch dimension.
+        """
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_target_verify()
+        )
+        if not get_is_capture_mode() or is_prefill:
+            yield False
+            return
+
+        metadata = self.forward_metadata
+        actual_seq_lengths_q = metadata.actual_seq_lengths_q
+        if actual_seq_lengths_q is not None:
+            query_rows = actual_seq_lengths_q.shape[0]
+        elif (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            num_draft_tokens = self.speculative_num_draft_tokens
+            assert num_draft_tokens is not None and num_draft_tokens > 0
+            assert num_query_tokens % num_draft_tokens == 0, (
+                "NPU DSA graph query tokens must be divisible by speculative "
+                f"tokens per request: {num_query_tokens} % {num_draft_tokens} != 0"
+            )
+            query_rows = num_query_tokens // num_draft_tokens
+        else:
+            query_rows = num_query_tokens
+
+        seq_lens = metadata.seq_lens
+        if metadata.seq_lens_cpu_int is not None:
+            # Recreate the eager CPU metadata adjustment on device. A host to
+            # device conversion is not supported while the NPU graph is captured.
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens = seq_lens + self.speculative_num_draft_tokens
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is not None
+            ):
+                seq_lens = seq_lens + self.speculative_step_id + 1
+
+        aligned_seq_lens, aligned_block_tables = (
+            align_lightning_indexer_graph_metadata(
+                query_rows,
+                seq_lens,
+                metadata.block_tables,
+            )
+        )
+
+        original_seq_lens = metadata.seq_lens
+        original_seq_lens_cpu_int = metadata.seq_lens_cpu_int
+        original_block_tables = metadata.block_tables
+        metadata.seq_lens = aligned_seq_lens
+        metadata.seq_lens_cpu_int = None
+        metadata.block_tables = aligned_block_tables
+        try:
+            yield (
+                aligned_seq_lens is not original_seq_lens
+                or aligned_block_tables is not original_block_tables
+                or original_seq_lens_cpu_int is not None
+            )
+        finally:
+            metadata.seq_lens = original_seq_lens
+            metadata.seq_lens_cpu_int = original_seq_lens_cpu_int
+            metadata.block_tables = original_block_tables
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1

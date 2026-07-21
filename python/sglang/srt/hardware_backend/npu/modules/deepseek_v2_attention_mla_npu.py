@@ -16,7 +16,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -426,15 +429,18 @@ def forward_dsa_prepare_npu(
             )
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
-        topk_indices = m.indexer(
-            hidden_states,
-            q_lora,
-            positions,
-            forward_batch,
-            m.layer_id,
-            layer_scatter_modes,
-            dynamic_scale,
-        )
+        with get_attn_backend().align_dsa_graph_metadata_for_indexer(
+            forward_batch, q_lora.shape[0]
+        ):
+            topk_indices = m.indexer(
+                hidden_states,
+                q_lora,
+                positions,
+                forward_batch,
+                m.layer_id,
+                layer_scatter_modes,
+                dynamic_scale,
+            )
     else:
         topk_indices = prev_topk_indices
 
