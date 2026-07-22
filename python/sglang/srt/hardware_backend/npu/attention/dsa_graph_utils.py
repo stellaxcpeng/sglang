@@ -3,6 +3,31 @@ from __future__ import annotations
 import torch
 
 
+def resolve_dsa_eager_query_tokens(
+    num_query_tokens_padded: int,
+    num_token_non_padded: int | None,
+    batch_size: int,
+    draft_tokens_per_req: int | None = None,
+) -> int:
+    """Resolve real NPU DSA query rows without reusing stale verify width."""
+    if draft_tokens_per_req is not None:
+        assert draft_tokens_per_req > 0, (
+            "NPU DSA draft tokens per request must be positive, got "
+            f"{draft_tokens_per_req}"
+        )
+        num_query_tokens = batch_size * draft_tokens_per_req
+    elif num_token_non_padded is not None:
+        num_query_tokens = int(num_token_non_padded)
+    else:
+        num_query_tokens = num_query_tokens_padded
+
+    assert 0 <= num_query_tokens <= num_query_tokens_padded, (
+        "NPU DSA real query rows must be within the padded query buffer: "
+        f"{num_query_tokens} not in [0, {num_query_tokens_padded}]"
+    )
+    return num_query_tokens
+
+
 def expand_dsa_sparse_indices(
     topk_indices: torch.Tensor, num_query_tokens: int
 ) -> torch.Tensor:

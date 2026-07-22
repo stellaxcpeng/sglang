@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 from sglang.srt.hardware_backend.npu.attention.dsa_graph_utils import (
     align_lightning_indexer_graph_metadata,
     expand_dsa_sparse_indices,
+    resolve_dsa_eager_query_tokens,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
@@ -1082,15 +1083,26 @@ class AscendAttnBackend(AttentionBackend):
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         num_query_tokens_padded = q_nope.shape[0]
-        num_token_non_padded = forward_batch.num_token_non_padded_cpu
-        trim_dummy_queries = (
-            not self.graph_mode
-            and not is_prefill
-            and num_token_non_padded is not None
-            and num_token_non_padded < num_query_tokens_padded
-        )
+        num_query_tokens = num_query_tokens_padded
+        if not self.graph_mode and not is_prefill:
+            draft_tokens_per_req = None
+            if (
+                forward_batch.spec_info is not None
+                and forward_batch.spec_info.is_draft_input()
+            ):
+                # EAGLE creates the ForwardBatch from the preceding verify batch,
+                # then replaces input_ids for every draft step. In eager mode,
+                # num_token_non_padded_cpu can therefore still contain the verify
+                # width even though a topk=1 draft step has one token per request.
+                draft_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
+            num_query_tokens = resolve_dsa_eager_query_tokens(
+                num_query_tokens_padded,
+                forward_batch.num_token_non_padded_cpu,
+                forward_batch.batch_size,
+                draft_tokens_per_req,
+            )
+        trim_dummy_queries = num_query_tokens < num_query_tokens_padded
         if trim_dummy_queries:
-            num_query_tokens = max(0, int(num_token_non_padded))
             q_nope = q_nope[:num_query_tokens]
             if q_pe is not None:
                 q_pe = q_pe[:num_query_tokens]
