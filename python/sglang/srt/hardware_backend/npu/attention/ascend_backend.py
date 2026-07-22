@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 )
 from sglang.srt.hardware_backend.npu.attention.dsa_graph_utils import (
     align_lightning_indexer_graph_metadata,
+    expand_dsa_sparse_indices,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
@@ -30,7 +31,6 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
@@ -47,13 +47,6 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
-
-
-def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
-    """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
-    if topk_indices.dim() == 2:
-        return topk_indices.unsqueeze(-2)
-    return topk_indices
 
 
 def _reshape_kv_for_fia_nz(
@@ -534,7 +527,7 @@ class AscendAttnBackend(AttentionBackend):
     def align_dsa_graph_metadata_for_indexer(
         self, forward_batch: ForwardBatch, num_query_tokens: int
     ):
-        """Temporarily align NPU DSA metadata during graph capture.
+        """Temporarily align NPU DSA indexer metadata for non-prefill calls.
 
         Attention-TP gathering can expand the static query buffer beyond the
         number of real request rows. The lightning indexer requires query, key
@@ -545,7 +538,7 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
         )
-        if not get_is_capture_mode() or is_prefill:
+        if is_prefill:
             yield False
             return
 
@@ -1088,36 +1081,76 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
+        num_query_tokens_padded = q_nope.shape[0]
+        num_token_non_padded = forward_batch.num_token_non_padded_cpu
+        trim_dummy_queries = (
+            not self.graph_mode
+            and not is_prefill
+            and num_token_non_padded is not None
+            and num_token_non_padded < num_query_tokens_padded
+        )
+        if trim_dummy_queries:
+            num_query_tokens = max(0, int(num_token_non_padded))
+            q_nope = q_nope[:num_query_tokens]
+            if q_pe is not None:
+                q_pe = q_pe[:num_query_tokens]
+            topk_indices = topk_indices[:num_query_tokens]
+
+            if num_query_tokens == 0:
+                return q_nope.new_zeros(
+                    (num_query_tokens_padded, *q_nope.shape[1:])
+                )
+
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
                 actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-        else:
-            if self.forward_metadata.actual_seq_lengths_q is None:
-                if (
-                    forward_batch.forward_mode.is_draft_extend_v2()
-                    or forward_batch.forward_mode.is_target_verify()
-                ):
-                    actual_seq_qlen = (
-                        torch.arange(
-                            self.speculative_num_draft_tokens,
-                            self.speculative_num_draft_tokens + q.shape[0],
-                            self.speculative_num_draft_tokens,
-                            dtype=torch.int32,
-                        )
-                        .to(q.device)
-                        .to(torch.int32)
-                    )
-                else:
-                    actual_seq_qlen = (
-                        torch.arange(1, q.shape[0] + 1).to(q.device).to(torch.int32)
-                    )
+        elif trim_dummy_queries or self.forward_metadata.actual_seq_lengths_q is None:
+            if (
+                forward_batch.forward_mode.is_draft_extend_v2()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
+                num_draft_tokens = self.speculative_num_draft_tokens
+                assert num_draft_tokens is not None and num_draft_tokens > 0
+                assert q_nope.shape[0] % num_draft_tokens == 0, (
+                    "NPU sparse-attention real-token count must be divisible by "
+                    "the number of speculative tokens per request: "
+                    f"{q_nope.shape[0]} % {num_draft_tokens} != 0"
+                )
+                actual_seq_qlen = torch.arange(
+                    num_draft_tokens,
+                    num_draft_tokens + q_nope.shape[0],
+                    num_draft_tokens,
+                    dtype=torch.int32,
+                    device=q_nope.device,
+                )
             else:
-                actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
+                actual_seq_qlen = torch.arange(
+                    1,
+                    q_nope.shape[0] + 1,
+                    dtype=torch.int32,
+                    device=q_nope.device,
+                )
+        else:
+            actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
 
         if self.forward_metadata.actual_seq_lengths_kv is not None:
             actual_seq_lengths_kv = self.forward_metadata.actual_seq_lengths_kv
+        elif trim_dummy_queries:
+            actual_seq_lengths_kv = self.forward_metadata.seq_lens
+            if self.forward_metadata.seq_lens_cpu_int is not None:
+                if forward_batch.forward_mode.is_target_verify():
+                    actual_seq_lengths_kv = (
+                        actual_seq_lengths_kv + self.speculative_num_draft_tokens
+                    )
+                elif (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    and forward_batch.spec_info is not None
+                ):
+                    actual_seq_lengths_kv = (
+                        actual_seq_lengths_kv + self.speculative_step_id + 1
+                    )
         elif self.forward_metadata.seq_lens_cpu_int is not None:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int
         else:
@@ -1139,7 +1172,21 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
-            topk_indices = _expand_dsa_sparse_indices(topk_indices)
+            topk_indices = expand_dsa_sparse_indices(topk_indices, q_nope.shape[0])
+            block_table = self.forward_metadata.block_tables
+            if trim_dummy_queries:
+                actual_bs = actual_seq_qlen.shape[0]
+                assert actual_seq_lengths_kv.shape[0] >= actual_bs, (
+                    "NPU sparse attention has fewer key sequences than query "
+                    f"sequences: {actual_seq_lengths_kv.shape[0]} < {actual_bs}"
+                )
+                assert block_table.shape[0] >= actual_bs, (
+                    "NPU sparse attention has fewer block-table rows than query "
+                    f"sequences: {block_table.shape[0]} < {actual_bs}"
+                )
+                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
+                block_table = block_table[:actual_bs]
+
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,
@@ -1154,7 +1201,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv=actual_seq_lengths_kv.to(
                     device=q_nope.device, dtype=torch.int32
                 ),
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_table,
                 sparse_block_size=1,
                 layout_query="TND",
                 layout_kv="PA_BSND",
@@ -1162,6 +1209,20 @@ class AscendAttnBackend(AttentionBackend):
                 attention_mode=2,
                 return_softmax_lse=False,
             )
+
+            if attn_out.shape[0] < num_query_tokens_padded:
+                attn_out = torch.cat(
+                    (
+                        attn_out,
+                        attn_out.new_zeros(
+                            (
+                                num_query_tokens_padded - attn_out.shape[0],
+                                *attn_out.shape[1:],
+                            )
+                        ),
+                    ),
+                    dim=0,
+                )
 
         return attn_out
 

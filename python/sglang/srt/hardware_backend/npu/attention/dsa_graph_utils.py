@@ -3,6 +3,33 @@ from __future__ import annotations
 import torch
 
 
+def expand_dsa_sparse_indices(
+    topk_indices: torch.Tensor, num_query_tokens: int
+) -> torch.Tensor:
+    """Pad dummy rows and expand [T, K] for NPU sparse attention."""
+    assert topk_indices.dim() in (2, 3), (
+        f"Expected DSA top-k indices with 2 or 3 dims, got {topk_indices.dim()}"
+    )
+    num_topk_rows = topk_indices.shape[0]
+    assert num_topk_rows <= num_query_tokens, (
+        f"DSA top-k rows ({num_topk_rows}) exceed query rows ({num_query_tokens})"
+    )
+    if num_topk_rows < num_query_tokens:
+        topk_indices = torch.cat(
+            (
+                topk_indices,
+                topk_indices.new_full(
+                    (num_query_tokens - num_topk_rows, *topk_indices.shape[1:]),
+                    -1,
+                ),
+            ),
+            dim=0,
+        )
+    if topk_indices.dim() == 2:
+        return topk_indices.unsqueeze(-2)
+    return topk_indices
+
+
 def align_lightning_indexer_graph_metadata(
     query_rows: int,
     actual_seq_lengths_kv: torch.Tensor,
