@@ -17,9 +17,9 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
     AscendTorchNativeAttnBackend,
 )
 from sglang.srt.hardware_backend.npu.attention.dsa_graph_utils import (
-    align_lightning_indexer_graph_metadata,
+    align_dsa_tnd_kv_metadata,
+    build_dsa_tnd_query_lengths,
     expand_dsa_sparse_indices,
-    resolve_dsa_eager_query_tokens,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
@@ -524,16 +524,66 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = False
 
+    def _get_aligned_dsa_tnd_metadata(
+        self, forward_batch: ForwardBatch, num_query_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build device-only TND metadata for the physical NPU query buffer."""
+        metadata = self.forward_metadata
+        if (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            tokens_per_sequence = self.speculative_num_draft_tokens
+            assert tokens_per_sequence is not None and tokens_per_sequence > 0
+        else:
+            tokens_per_sequence = 1
+
+        assert num_query_tokens % tokens_per_sequence == 0, (
+            "NPU DSA query tokens must be divisible by tokens per sequence: "
+            f"{num_query_tokens} % {tokens_per_sequence} != 0"
+        )
+        query_rows = num_query_tokens // tokens_per_sequence
+        actual_seq_lengths_q = metadata.actual_seq_lengths_q
+        if (
+            actual_seq_lengths_q is None
+            or actual_seq_lengths_q.shape[0] != query_rows
+            or actual_seq_lengths_q.device != metadata.seq_lens.device
+        ):
+            actual_seq_lengths_q = build_dsa_tnd_query_lengths(
+                num_query_tokens,
+                tokens_per_sequence,
+                metadata.seq_lens,
+            )
+
+        seq_lens = metadata.seq_lens
+        block_tables = metadata.block_tables
+        if metadata.seq_lens_cpu_int is not None:
+            # The CPU tensor describes only real request rows. Use its row count,
+            # but keep all values and operations on NPU because PD warm-up can
+            # enter eager fallback while the NPU runtime is still capturing.
+            real_rows = metadata.seq_lens_cpu_int.shape[0]
+            seq_lens = seq_lens[:real_rows]
+            block_tables = block_tables[:real_rows]
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens = seq_lens + self.speculative_num_draft_tokens
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is not None
+            ):
+                seq_lens = seq_lens + self.speculative_step_id + 1
+
+        actual_seq_lengths_kv, block_tables = align_dsa_tnd_kv_metadata(
+            query_rows,
+            seq_lens,
+            block_tables,
+        )
+        return actual_seq_lengths_q, actual_seq_lengths_kv, block_tables
+
     @contextmanager
-    def align_dsa_graph_metadata_for_indexer(
+    def align_dsa_tnd_metadata_for_indexer(
         self, forward_batch: ForwardBatch, num_query_tokens: int
     ):
-        """Temporarily align NPU DSA indexer metadata for non-prefill calls.
-
-        Attention-TP gathering can expand the static query buffer beyond the
-        number of real request rows. The lightning indexer requires query, key
-        lengths, and block tables to expose the same TND batch dimension.
-        """
+        """Temporarily align non-prefill NPU DSA indexer TND metadata."""
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -544,56 +594,32 @@ class AscendAttnBackend(AttentionBackend):
             return
 
         metadata = self.forward_metadata
-        actual_seq_lengths_q = metadata.actual_seq_lengths_q
-        if actual_seq_lengths_q is not None:
-            query_rows = actual_seq_lengths_q.shape[0]
-        elif (
-            forward_batch.forward_mode.is_draft_extend_v2()
-            or forward_batch.forward_mode.is_target_verify()
-        ):
-            num_draft_tokens = self.speculative_num_draft_tokens
-            assert num_draft_tokens is not None and num_draft_tokens > 0
-            assert num_query_tokens % num_draft_tokens == 0, (
-                "NPU DSA graph query tokens must be divisible by speculative "
-                f"tokens per request: {num_query_tokens} % {num_draft_tokens} != 0"
-            )
-            query_rows = num_query_tokens // num_draft_tokens
-        else:
-            query_rows = num_query_tokens
-
-        seq_lens = metadata.seq_lens
-        if metadata.seq_lens_cpu_int is not None:
-            # Recreate the eager CPU metadata adjustment on device. A host to
-            # device conversion is not supported while the NPU graph is captured.
-            if forward_batch.forward_mode.is_target_verify():
-                seq_lens = seq_lens + self.speculative_num_draft_tokens
-            elif (
-                forward_batch.forward_mode.is_decode_or_idle()
-                and forward_batch.spec_info is not None
-            ):
-                seq_lens = seq_lens + self.speculative_step_id + 1
-
-        aligned_seq_lens, aligned_block_tables = (
-            align_lightning_indexer_graph_metadata(
-                query_rows,
-                seq_lens,
-                metadata.block_tables,
-            )
+        (
+            aligned_actual_seq_lengths_q,
+            aligned_seq_lens,
+            aligned_block_tables,
+        ) = self._get_aligned_dsa_tnd_metadata(
+            forward_batch,
+            num_query_tokens,
         )
 
+        original_actual_seq_lengths_q = metadata.actual_seq_lengths_q
         original_seq_lens = metadata.seq_lens
         original_seq_lens_cpu_int = metadata.seq_lens_cpu_int
         original_block_tables = metadata.block_tables
+        metadata.actual_seq_lengths_q = aligned_actual_seq_lengths_q
         metadata.seq_lens = aligned_seq_lens
         metadata.seq_lens_cpu_int = None
         metadata.block_tables = aligned_block_tables
         try:
             yield (
-                aligned_seq_lens is not original_seq_lens
+                aligned_actual_seq_lengths_q is not original_actual_seq_lengths_q
+                or aligned_seq_lens is not original_seq_lens
                 or aligned_block_tables is not original_block_tables
                 or original_seq_lens_cpu_int is not None
             )
         finally:
+            metadata.actual_seq_lengths_q = original_actual_seq_lengths_q
             metadata.seq_lens = original_seq_lens
             metadata.seq_lens_cpu_int = original_seq_lens_cpu_int
             metadata.block_tables = original_block_tables
@@ -1082,91 +1108,29 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        num_query_tokens_padded = q_nope.shape[0]
-        num_query_tokens = num_query_tokens_padded
-        if not self.graph_mode and not is_prefill:
-            draft_tokens_per_req = None
-            if (
-                forward_batch.spec_info is not None
-                and forward_batch.spec_info.is_draft_input()
-            ):
-                # EAGLE creates the ForwardBatch from the preceding verify batch,
-                # then replaces input_ids for every draft step. In eager mode,
-                # num_token_non_padded_cpu can therefore still contain the verify
-                # width even though a topk=1 draft step has one token per request.
-                draft_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
-            num_query_tokens = resolve_dsa_eager_query_tokens(
-                num_query_tokens_padded,
-                forward_batch.num_token_non_padded_cpu,
-                forward_batch.batch_size,
-                draft_tokens_per_req,
-            )
-        trim_dummy_queries = num_query_tokens < num_query_tokens_padded
-        if trim_dummy_queries:
-            q_nope = q_nope[:num_query_tokens]
-            if q_pe is not None:
-                q_pe = q_pe[:num_query_tokens]
-            topk_indices = topk_indices[:num_query_tokens]
-
-            if num_query_tokens == 0:
-                return q_nope.new_zeros(
-                    (num_query_tokens_padded, *q_nope.shape[1:])
-                )
-
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
                 actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-        elif trim_dummy_queries or self.forward_metadata.actual_seq_lengths_q is None:
-            if (
-                forward_batch.forward_mode.is_draft_extend_v2()
-                or forward_batch.forward_mode.is_target_verify()
-            ):
-                num_draft_tokens = self.speculative_num_draft_tokens
-                assert num_draft_tokens is not None and num_draft_tokens > 0
-                assert q_nope.shape[0] % num_draft_tokens == 0, (
-                    "NPU sparse-attention real-token count must be divisible by "
-                    "the number of speculative tokens per request: "
-                    f"{q_nope.shape[0]} % {num_draft_tokens} != 0"
+            if self.forward_metadata.actual_seq_lengths_kv is not None:
+                actual_seq_lengths_kv = (
+                    self.forward_metadata.actual_seq_lengths_kv
                 )
-                actual_seq_qlen = torch.arange(
-                    num_draft_tokens,
-                    num_draft_tokens + q_nope.shape[0],
-                    num_draft_tokens,
-                    dtype=torch.int32,
-                    device=q_nope.device,
-                )
+            elif self.forward_metadata.seq_lens_cpu_int is not None:
+                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int
             else:
-                actual_seq_qlen = torch.arange(
-                    1,
-                    q_nope.shape[0] + 1,
-                    dtype=torch.int32,
-                    device=q_nope.device,
-                )
+                actual_seq_lengths_kv = self.forward_metadata.seq_lens
+            block_table = self.forward_metadata.block_tables
         else:
-            actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
-
-        if self.forward_metadata.actual_seq_lengths_kv is not None:
-            actual_seq_lengths_kv = self.forward_metadata.actual_seq_lengths_kv
-        elif trim_dummy_queries:
-            actual_seq_lengths_kv = self.forward_metadata.seq_lens
-            if self.forward_metadata.seq_lens_cpu_int is not None:
-                if forward_batch.forward_mode.is_target_verify():
-                    actual_seq_lengths_kv = (
-                        actual_seq_lengths_kv + self.speculative_num_draft_tokens
-                    )
-                elif (
-                    forward_batch.forward_mode.is_decode_or_idle()
-                    and forward_batch.spec_info is not None
-                ):
-                    actual_seq_lengths_kv = (
-                        actual_seq_lengths_kv + self.speculative_step_id + 1
-                    )
-        elif self.forward_metadata.seq_lens_cpu_int is not None:
-            actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int
-        else:
-            actual_seq_lengths_kv = self.forward_metadata.seq_lens
+            (
+                actual_seq_qlen,
+                actual_seq_lengths_kv,
+                block_table,
+            ) = self._get_aligned_dsa_tnd_metadata(
+                forward_batch,
+                q_nope.shape[0],
+            )
 
         if (
             is_prefill
@@ -1185,20 +1149,6 @@ class AscendAttnBackend(AttentionBackend):
             )
         else:
             topk_indices = expand_dsa_sparse_indices(topk_indices, q_nope.shape[0])
-            block_table = self.forward_metadata.block_tables
-            if trim_dummy_queries:
-                actual_bs = actual_seq_qlen.shape[0]
-                assert actual_seq_lengths_kv.shape[0] >= actual_bs, (
-                    "NPU sparse attention has fewer key sequences than query "
-                    f"sequences: {actual_seq_lengths_kv.shape[0]} < {actual_bs}"
-                )
-                assert block_table.shape[0] >= actual_bs, (
-                    "NPU sparse attention has fewer block-table rows than query "
-                    f"sequences: {block_table.shape[0]} < {actual_bs}"
-                )
-                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
-                block_table = block_table[:actual_bs]
-
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,
@@ -1221,20 +1171,6 @@ class AscendAttnBackend(AttentionBackend):
                 attention_mode=2,
                 return_softmax_lse=False,
             )
-
-            if attn_out.shape[0] < num_query_tokens_padded:
-                attn_out = torch.cat(
-                    (
-                        attn_out,
-                        attn_out.new_zeros(
-                            (
-                                num_query_tokens_padded - attn_out.shape[0],
-                                *attn_out.shape[1:],
-                            )
-                        ),
-                    ),
-                    dim=0,
-                )
 
         return attn_out
 

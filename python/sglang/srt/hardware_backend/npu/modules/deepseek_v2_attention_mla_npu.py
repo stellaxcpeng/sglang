@@ -429,7 +429,7 @@ def forward_dsa_prepare_npu(
             )
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
-        with get_attn_backend().align_dsa_graph_metadata_for_indexer(
+        with get_attn_backend().align_dsa_tnd_metadata_for_indexer(
             forward_batch, q_lora.shape[0]
         ):
             topk_indices = m.indexer(
