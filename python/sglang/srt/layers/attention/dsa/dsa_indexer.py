@@ -2079,10 +2079,6 @@ class Indexer(MultiPlatformOp):
         layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-        if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
-        else:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens_cpu_int
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -2233,6 +2229,12 @@ class Indexer(MultiPlatformOp):
             layer_id, forward_batch.out_cache_loc, k
         )
         if is_prefill:
+            if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
+                actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
+            else:
+                actual_seq_lengths_kv = (
+                    get_attn_backend().forward_metadata.seq_lens_cpu_int
+                )
             if (
                 self.dsa_enable_prefill_cp
                 and forward_batch.attn_cp_metadata is not None
@@ -2269,29 +2271,13 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
         else:
-            if get_attn_backend().forward_metadata.actual_seq_lengths_q is None:
-                if (
-                    forward_batch.forward_mode.is_draft_extend_v2()
-                    or forward_batch.forward_mode.is_target_verify()
-                ):
-                    num_draft_tokens = get_attn_backend().speculative_num_draft_tokens
-                    actual_seq_lengths_q = torch.arange(
-                        num_draft_tokens,
-                        num_draft_tokens + bs,
-                        num_draft_tokens,
-                        dtype=torch.int32,
-                        device=k.device,
-                    )
-                else:
-                    actual_seq_lengths_q = torch.tensor(
-                        [1 + i * 1 for i in range(bs)],
-                        dtype=torch.int32,
-                        device=k.device,
-                    )
-            else:
-                actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
-                )
+            (
+                actual_seq_lengths_q,
+                actual_seq_lengths_kv,
+                block_table,
+            ) = get_attn_backend().get_dsa_tnd_metadata(
+                forward_batch, q.shape[0]
+            )
 
         past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
 
@@ -2305,7 +2291,8 @@ class Indexer(MultiPlatformOp):
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
-        block_table = get_attn_backend().forward_metadata.block_tables
+        if is_prefill:
+            block_table = get_attn_backend().forward_metadata.block_tables
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
