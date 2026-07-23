@@ -47,17 +47,22 @@ class AscendKVManager(MooncakeKVManager):
     ) -> Tuple[List[int], List[int], int]:
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
-        start_layer = self.kv_args.prefill_start_layer
         kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)
         hidden_kv_layers = getattr(self.kv_args, "hidden_kv_layers", 0)
         draft_kv_layers = getattr(self.kv_args, "draft_kv_layers", 0)
         src_layers = len(src_kv_ptrs) // kv_buf_groups
         dst_layers = len(dst_kv_ptrs) // kv_buf_groups
-        end_layer = start_layer + src_layers
         if src_layers == dst_layers:
             sliced_dst_kv_ptrs = dst_kv_ptrs
         else:
             sliced_dst_kv_ptrs = []
+            start_layer = self.kv_args.prefill_start_layer
+            transfer_draft_kv = get_pp_group().is_last_rank and draft_kv_layers
+            if transfer_draft_kv:
+                end_layer = start_layer + src_layers - draft_kv_layers
+            else:
+                end_layer = start_layer + src_layers
+
             # target kv
             for i in range(kv_buf_groups):
                 layer_offset = i * hidden_kv_layers
@@ -65,7 +70,7 @@ class AscendKVManager(MooncakeKVManager):
                     dst_kv_ptrs[layer_offset + start_layer : layer_offset + end_layer]
                 )
             # draft kv
-            if get_pp_group().is_last_rank and draft_kv_layers:
+            if transfer_draft_kv:
                 for i in range(kv_buf_groups):
                     layer_offset = i * draft_kv_layers + kv_buf_groups*hidden_kv_layers
                     sliced_dst_kv_ptrs.extend(
