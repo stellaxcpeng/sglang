@@ -71,6 +71,8 @@ class AscendKVManager(MooncakeKVManager):
                     sliced_dst_kv_ptrs.extend(
                         dst_kv_ptrs[layer_offset: layer_offset + draft_kv_layers]
                     )
+        layers_current_pp_stage = len(src_kv_ptrs)
+        return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
             
 
     def send_kvcache(
